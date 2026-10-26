@@ -8,6 +8,8 @@ tools:
   - Glob
   - Grep
   - Bash
+  - WebFetch
+  - mcp__github
 model: claude-sonnet-5-5
 ---
 You are a Senior DevOps / Platform Engineer for .NET and .NET MAUI systems.
