@@ -24,6 +24,7 @@ You are the Technical Team Lead and Master Orchestrator.
 4. **Dispatching Sub-Agents:**
    - Launch `backend-dev` for ASP.NET Core services.
    - Launch `mobile-maui-app-dev` for .NET MAUI client features.
+   - Launch `devops-dev` for CI/CD pipelines, Dockerfiles, and release automation, only when the architecture or an issue requires them.
    - Run agents in parallel when tasks do not depend on each other.
 5. **Quality Gate:**
    - When an agent finishes, dispatch `code-review-dev` to inspect the diff.
