@@ -106,6 +106,7 @@ flowchart LR
 | AD-13 | The `features` map in `GET /api/v1/me/entitlement` and sync responses is **filled in by the Gateway** (owner of the map) from the *stored* tier. SubscriptionService does not know the map. | Keeps one authoritative map (D15). | FR-ENT-06 (where it is computed) |
 | AD-14 | `TierAuthorization:EnforcementMode` = `Enforce` (default) or `AuditOnly`. In AuditOnly the Gateway logs and counts would-be denials and still allows the request. Production deploys with `AuditOnly` (explicit `AllowAuditOnlyInProduction=true`) **until the app release containing local scoring mode (APP-1) is adopted**, then switches to `Enforce` by config change. | Prevents F1 from breaking free users on older app versions on the day the Gateway ships. | Addition (rollout safety) |
 | AD-15 | TLS terminates at nginx (Let's Encrypt via certbot container, **or** a Cloudflare named tunnel). This is a prerequisite for the real webhook secret, and the app must switch to `https://`. The webhook is never accepted over plain HTTP in Production: nginx returns 403 unless the request is HTTPS (`$scheme` / `X-Forwarded-Proto` when tunnelled). | F5. | FR-WH-02 hardening |
+| AD-16 | **Database structure is EF Core code-first, applied only by a migration bundle in a separate migrator container.** Each service builds `dotnet ef migrations bundle` (self-contained, linux-x64 and linux-arm64) in a `migrator` Dockerfile target (images `lsc-identity-migrator`, `lsc-subscriptions-migrator`) run as one-shot compose services before the service starts. Two DB logins per service: `*_migrator` (owns the schema, CREATE on the database; its connection string is mounted ONLY into the migrator container) and `*_svc` (runtime: USAGE, DML, sequences, EXECUTE; only SELECT+INSERT on append-only audit tables). Schemas, tables, constraints, default privileges, REVOKEs and purge functions are written in EF migrations (idempotent, role-guarded, tested with Testcontainers). DevOps provisions only roles and passwords (`01-roles.sql`), because passwords are secrets. `search_path` for `*_svc` is set in the bootstrap (a migrator cannot alter other roles). Services have no DDL rights and no migrate command or MigrateOnStartup. | Least privilege: a compromised service cannot alter schema; schema history stays in the Users repo next to the code. | Owner decision (supersedes the in-service migrate design) |
 | AD-16 | The per-UID sync rate limit (6/min) and the admin rate limit (30/min per admin) are enforced in the **Gateway** (`AddRateLimiter`, partitioned by `sub`, 429 + `Retry-After`). SubscriptionService adds only a global concurrency limiter that protects the RevenueCat quota. | Edge enforcement. A single Gateway instance means in-memory partitions are exact. | FR-SYNC-01 |
 | AD-17 | Webhook secret rotation: SubscriptionService accepts `RevenueCat__WebhookAuthToken` and an optional `RevenueCat__WebhookAuthTokenPrevious` (both constant-time compared, both >= 32 chars in Production). | Allows zero-downtime rotation. | FR-WH-02 addition |
 | AD-18 | RevenueCat in the app: **`Tonestro.Maui.RevenueCat.Android` 10.14.1.x (+ `.Extensions`)** behind `IPurchasesService`, confirmed by a 2-day spike. Fallback order: own binding `LSC.RevenueCat.Binding` in Libraries, then `Kebechet.Maui.RevenueCat.InAppBilling`, then Play Billing + RevenueCat REST. See section 15. | Desk research on nuget.org (2026-10-26). | A5 |
@@ -189,7 +190,7 @@ flowchart TB
     REC --> RCC & IDC & DB
 ```
 
-IdentityService has the same layering with these parts: `ProvisionUserCommand`, `SetTierClaimsCommand` (version guard + merge), `ITierClaimsWriter` (`FirebaseAdminClaimsWriter` | `FakeFirebaseAdmin`), `IdentityDbContext` (schema `identity`), and a CLI entry (`admin grant|revoke`, `healthcheck`, `migrate`) dispatched in `Program.cs` before the web host is built.
+IdentityService has the same layering with these parts: `ProvisionUserCommand`, `SetTierClaimsCommand` (version guard + merge), `ITierClaimsWriter` (`FirebaseAdminClaimsWriter` | `FakeFirebaseAdmin`), `IdentityDbContext` (schema `identity`), and a CLI entry (`admin grant|revoke`, `healthcheck`) dispatched in `Program.cs` before the web host is built.
 
 ---
 
@@ -221,7 +222,7 @@ LiveScoreCounter.Users/
 ├── NuGet.config                       # github feed + packageSourceMapping LSC.* (as in App)
 ├── docker-compose.yml                 # LOCAL DEV ONLY: postgres + identity + subscriptions in Fake mode
 ├── docker/postgres/init/
-│   └── 01-schemas-and-roles.sql       # schemas identity/subscription, roles, grants, audit REVOKEs
+│   └── 01-roles.sql                   # login roles + passwords only; schemas, tables, grants are EF migrations
 ├── tools/k6/
 │   ├── webhook-burst.js               # NFR-03: 50 ev/s for 60 s
 │   └── gateway-gated-routes.js        # NFR-03: 200 RPS on gated routes
@@ -592,7 +593,7 @@ sequenceDiagram
 | Subscriptions | `Infrastructure:Proxies:Identity:BaseUrl` | `http://identity:8080` | |
 | Identity | `Firebase:Mode` / `Firebase:ProjectId` | `Real` / `livescorecounter-mg` | |
 | Identity | `Claims:ExpiryBufferHours` | 6 | FR-ENT-03 |
-| Both | `Database:MigrateOnStartup` | `true` | EF Core 9+ migration lock, own schema history table |
+| Both | _(removed)_ | n/a | Services never run migrations; see AD-16 |
 | App | `Billing:Provider` | `RevenueCat` (`Fake` allowed in Debug only) | |
 | App | `Billing:RevenueCatPublicApiKey` | provided by owner | public key, committed in appsettings is acceptable |
 | App | `Legal:TermsUrl`, `Legal:PrivacyUrl` | owner (O3) | NFR-16 |
@@ -850,7 +851,7 @@ Agents: **backend-dev** (BE), **mobile-maui-app-dev** (MOB), **devops-dev** (OPS
 | APP-1 | App | **Local scoring mode** (section 15.2) + tests (AC-APP-01, US-01) | MOB | - (start immediately) | M |
 | LIB-1 | Libraries | `LSC.Authorization.Tiers` + `.AspNetCore` + tests + `authorization-tiers.yml` (version 0.1.0) | BE | contracts (frozen) | M |
 | LIB-2 | Libraries | `LSC.Mediator.Extensions` 0.3.0: `ResultStatus.Conflict/Unavailable` | BE | - | S |
-| USR-1 | Users | IdentityService: domain (claims merge/size/version), EF + migrations, Firebase Admin + Fake, `/api/v1/users/me`, `/internal/v1/users/{uid}/tier-claims`, CLI (`admin`, `healthcheck`, `migrate`), health/metrics, Dockerfile | BE | OPS-0, LIB-1 (claim names), LIB-2 | M |
+| USR-1 | Users | IdentityService: domain (claims merge/size/version), EF + migrations, Firebase Admin + Fake, `/api/v1/users/me`, `/internal/v1/users/{uid}/tier-claims`, CLI (`admin`, `healthcheck`; migrations run in the separate migrator container, AD-16), health/metrics, Dockerfile | BE | OPS-0, LIB-1 (claim names), LIB-2 | M |
 | USR-2 | Users | SubscriptionService core: domain, RevenueCat client + Fake, EF + migrations, webhook ingest, processing worker + backoff + dead-letter, provision, me/entitlement, sync, claim push + catch-up | BE | OPS-0, USR-1 Dto, LIB-2 | L |
 | USR-3 | Users | SubscriptionService admin endpoints, reconciliation, retention, admin audit | BE | USR-2 | M |
 | USR-4 | Users | Dto/Client NuGets (`LSC.Identity.*`, `LSC.Subscriptions.*`) + nugets workflows | BE (code) + OPS (workflows) | USR-1, USR-2 | S |
