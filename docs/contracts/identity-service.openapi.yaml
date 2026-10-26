@@ -1,0 +1,299 @@
+openapi: 3.1.0
+info:
+  title: LSC Identity API (IdentityService)
+  version: 1.0.0
+  summary: User registry and the single writer of Firebase custom claims (PRD D3, FR-USR, FR-ENT-03).
+  description: |
+    Repository `SirLecram/LiveScoreCounter.Users`, solution `src/LSC.Identity`, image `ghcr.io/sirlecram/lsc-identity`.
+
+    **Exposure.** Not routed by nginx. Reachable only on the Docker `internal-net` network:
+    * `/api/v1/**` is called by the API Gateway, which forwards the caller's Firebase ID token (header propagation).
+    * `/internal/v1/**` is called by SubscriptionService with `X-Internal-Key` (PRD NFR-08).
+
+    **Admin claim bootstrap** has no HTTP endpoint (PRD FR-ADM-05, D12). It is a CLI inside the container:
+    `docker exec lsc-identity dotnet LSC.Identity.dll admin grant <uid> --reason "<text>"` and `admin revoke <uid> --reason "<text>"`.
+
+    **Claims written** (merged with all other existing claims, never dropping them, payload < 1000 bytes):
+    * `tier` - string, set only when the tier is not the default tier (removed for `free`).
+    * `tier_exp` - Unix seconds = entitlement `expiresAt` + `Claims:ExpiryBufferHours` (default 6). Omitted when there is no expiry.
+    * `tier_ver` - int64, entitlement version. A write with a lower version than the stored one is rejected as stale.
+    * `admin` - boolean, managed only by the CLI.
+
+    Frozen for implementation of PRD `docs/prd/premium-tiers.md` v1.1. Architecture: `docs/architecture/premium-tiers.md`.
+  license:
+    name: Proprietary - internal use only
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://identity:8080
+    description: Docker internal-net (compose service `identity`, container `lsc-identity`)
+  - url: http://localhost:5310
+    description: Local development
+tags:
+  - name: Users
+    description: User provisioning (called through the Gateway)
+  - name: Claims
+    description: Internal tier-claim management (called by SubscriptionService)
+  - name: Health
+    description: Liveness, readiness and metrics (internal only)
+
+paths:
+  /api/v1/users/me:
+    post:
+      tags: [Users]
+      operationId: provisionCurrentUser
+      summary: Idempotently upsert the calling user (PRD FR-USR-01).
+      description: |
+        UID is taken from the verified token (`sub`), never from the body. Creates the registry row on first call
+        (`status=active`, `createdAt`), otherwise updates `lastSeenAt`. N calls create exactly one row.
+      security:
+        - FirebaseBearer: []
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: User existed and was touched.
+          headers:
+            X-Correlation-Id:
+              $ref: './lsc-common.openapi.yaml#/components/headers/X-Correlation-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '201':
+          description: User created.
+          headers:
+            X-Correlation-Id:
+              $ref: './lsc-common.openapi.yaml#/components/headers/X-Correlation-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '500':
+          $ref: './lsc-common.openapi.yaml#/components/responses/InternalServerError'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /internal/v1/users/{uid}/tier-claims:
+    put:
+      tags: [Claims]
+      operationId: setTierClaims
+      summary: Apply the tier claims for a user (merge, version-guarded).
+      description: |
+        Called only by SubscriptionService after an entitlement change (webhook, sync, reconcile, admin).
+        Processing is serialized per UID (PostgreSQL advisory transaction lock) and:
+
+        1. If `version` < stored `tier_claim_version` -> **409 stale**, nothing written (PRD FR-ENT-03).
+        2. If `version` == stored version and the desired claims equal the current Firebase claims -> 200 `unchanged`.
+        3. Otherwise read current Firebase custom claims, replace only `tier`/`tier_exp`/`tier_ver`, keep every other claim
+           (for example `admin`), assert serialized size < 1000 bytes, write via Firebase Admin SDK, store the version and append
+           a `identity.claim_audit` row.
+
+        If the UID is missing from the registry but exists in Firebase, the registry row is created implicitly.
+      security:
+        - InternalKey: []
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/Uid'
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetTierClaimsRequest'
+            examples:
+              premium:
+                value:
+                  tier: premium
+                  expiresAt: '2026-11-26T10:00:00Z'
+                  version: 7
+                  cause: 'webhook:RENEWAL:7d3c2f9a-1b2c-4d5e-8f90-a1b2c3d4e5f6'
+              free:
+                value:
+                  tier: free
+                  expiresAt: null
+                  version: 8
+                  cause: reconcile
+      responses:
+        '200':
+          description: Claims applied or already up to date.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetTierClaimsResult'
+        '400':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadRequest'
+        '401':
+          description: Missing or wrong `X-Internal-Key` (constant-time comparison). Nothing logged except the fact.
+          content:
+            application/problem+json:
+              schema:
+                $ref: './lsc-common.openapi.yaml#/components/schemas/ProblemDetails'
+        '404':
+          description: UID exists neither in the registry nor in Firebase Auth (`type` = `.../problems/user-not-found`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: './lsc-common.openapi.yaml#/components/schemas/ProblemDetails'
+        '409':
+          description: Stale write - `version` lower than the stored claim version.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/StaleTierClaimsProblem'
+        '422':
+          description: Resulting claims payload would be >= 1000 bytes (`type` = `.../problems/claims-too-large`). Should never happen; alerts.
+          content:
+            application/problem+json:
+              schema:
+                $ref: './lsc-common.openapi.yaml#/components/schemas/ProblemDetails'
+        '502':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadGateway'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: getLiveness
+      summary: Process is alive.
+      security: []
+      responses:
+        '200':
+          description: Healthy.
+          content:
+            text/plain:
+              schema:
+                type: string
+                examples: [Healthy]
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: getReadiness
+      summary: Ready to serve (database reachable). Firebase reported as Degraded, never Unhealthy (PRD NFR-06).
+      security: []
+      responses:
+        '200':
+          description: Healthy or Degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthReport'
+        '503':
+          description: Unhealthy (database unreachable).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthReport'
+  /metrics:
+    get:
+      tags: [Health]
+      operationId: getMetrics
+      summary: Prometheus text exposition. Internal network only.
+      security: []
+      responses:
+        '200':
+          description: Metrics.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    FirebaseBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: Firebase ID token (JWT), forwarded by the Gateway
+    InternalKey:
+      type: apiKey
+      in: header
+      name: X-Internal-Key
+      description: Shared secret (`Security__InternalServiceKey`, >= 32 chars, Docker secret). Compared in constant time.
+  schemas:
+    UserStatus:
+      type: string
+      enum: [active, disabled]
+    UserProfile:
+      type: object
+      required: [uid, status, createdAt, lastSeenAt, isNew]
+      properties:
+        uid:
+          type: string
+          maxLength: 128
+        status:
+          $ref: '#/components/schemas/UserStatus'
+        createdAt:
+          type: string
+          format: date-time
+        lastSeenAt:
+          type: string
+          format: date-time
+        isNew:
+          type: boolean
+          description: true when this call created the user.
+    SetTierClaimsRequest:
+      type: object
+      required: [tier, version, cause]
+      additionalProperties: false
+      properties:
+        tier:
+          $ref: './lsc-common.openapi.yaml#/components/schemas/TierName'
+        expiresAt:
+          type: [string, 'null']
+          format: date-time
+          description: Entitlement expiry (UTC). IdentityService adds `Claims:ExpiryBufferHours` to compute `tier_exp`. Ignored for the default tier.
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+        cause:
+          type: string
+          maxLength: 200
+          description: 'Audit cause: `webhook:<type>:<eventId>`, `sync`, `reconcile`, `admin:<adminUid>`.'
+    ClaimsOutcome:
+      type: string
+      enum: [applied, unchanged]
+    SetTierClaimsResult:
+      type: object
+      required: [uid, outcome, currentVersion, claimsSizeBytes]
+      properties:
+        uid:
+          type: string
+        outcome:
+          $ref: '#/components/schemas/ClaimsOutcome'
+        currentVersion:
+          type: integer
+          format: int64
+        tierExp:
+          type: [integer, 'null']
+          format: int64
+          description: Value written to `tier_exp` (Unix seconds) or null when omitted.
+        claimsSizeBytes:
+          type: integer
+          maximum: 999
+    StaleTierClaimsProblem:
+      allOf:
+        - $ref: './lsc-common.openapi.yaml#/components/schemas/ProblemDetails'
+        - type: object
+          required: [currentVersion]
+          properties:
+            type:
+              const: https://livescorecounter.app/problems/stale-tier-claims
+            status:
+              const: 409
+            currentVersion:
+              type: integer
+              format: int64
+    HealthReport:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [Healthy, Degraded, Unhealthy]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [Healthy, Degraded, Unhealthy]
