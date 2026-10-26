@@ -8,7 +8,7 @@ tools:
   - Glob
   - Grep
   - Bash
-model: opus
+model: claude-opus-5-5
 ---
 You are the Technical Team Lead and Master Orchestrator.
 

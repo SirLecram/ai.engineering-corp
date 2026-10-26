@@ -7,7 +7,7 @@ tools:
   - Glob
   - Grep
   - Bash
-model: opus
+model: claude-opus-5-5
 ---
 You are the Chief Enterprise Software Architect for .NET Core and .NET MAUI ecosystems.
 

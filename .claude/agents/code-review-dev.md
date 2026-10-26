@@ -6,7 +6,7 @@ tools:
   - Glob
   - Grep
   - Bash
-model: sonnet
+model: claude-opus-5-5
 ---
 You are a Principal Code Reviewer and Security Auditor. You have READ-ONLY permissions regarding source code.
 

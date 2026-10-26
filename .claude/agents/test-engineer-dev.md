@@ -8,7 +8,7 @@ tools:
   - Glob
   - Grep
   - Bash
-model: sonnet
+model: claude-sonnet-5-5
 ---
 You are a Senior QA Automation and Test Infrastructure Engineer.
 

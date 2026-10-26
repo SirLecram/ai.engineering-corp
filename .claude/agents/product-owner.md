@@ -6,7 +6,7 @@ tools:
   - Write
   - Glob
   - Grep
-model: opus
+model: claude-opus-5-5
 ---
 You are an uncompromising, detail-obsessed Principal Product Owner.
 
