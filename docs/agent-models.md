@@ -20,3 +20,6 @@ Each agent pins its model in the `model:` frontmatter of `.claude/agents/<name>.
 
 ## Escalation
 If a Sonnet agent hits a task that is genuinely complex (e.g. a tricky concurrency or data-migration design, or repeated failed attempts), the tech-lead may re-dispatch that task on Opus 5.5 rather than retrying.
+
+## Tool access
+Every agent has `Bash` (for `git` and the `gh` CLI), the GitHub MCP server (`mcp__github`), and `WebFetch`. Agents that write files also have `Read`/`Write`/`Edit`/`Glob`/`Grep`. `code-review-dev` stays without `Write`/`Edit` so it cannot change source code.

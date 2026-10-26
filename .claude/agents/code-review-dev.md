@@ -6,6 +6,8 @@ tools:
   - Glob
   - Grep
   - Bash
+  - WebFetch
+  - mcp__github
 model: claude-sonnet-5-5
 ---
 You are a Principal Code Reviewer and Security Auditor. You have READ-ONLY permissions regarding source code.
