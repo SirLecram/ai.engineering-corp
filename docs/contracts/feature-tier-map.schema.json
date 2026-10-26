@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://livescorecounter.app/schemas/feature-tier-map/v1.json",
+  "title": "LSC feature -> tier map",
+  "description": "PRD premium-tiers FR-MAP-01/04. The root schema validates the `TierAuthorization` configuration section of the API Gateway (appsettings.json / environment variables). `$defs/FeatureMapDocument` validates the public projection served at GET /api/v1/features and the app's embedded fallback copy. Semantic rules that JSON Schema cannot express are listed in `x-lsc-semantic-rules` and MUST be enforced by `TierAuthorizationOptionsValidator` (IValidateOptions, ValidateOnStart) in LSC.Authorization.Tiers.",
+  "type": "object",
+  "required": ["Tiers", "Features", "Routes"],
+  "additionalProperties": false,
+  "properties": {
+    "EnforcementMode": {
+      "description": "Enforce = deny with 403 (default). AuditOnly = evaluate, log and count `gateway_tier_denied_total{mode=\"audit\"}` but allow. AuditOnly exists only for the rollout window before the app version with the local scoring mode is adopted; it is refused in Production unless `AllowAuditOnlyInProduction` is true.",
+      "enum": ["Enforce", "AuditOnly"],
+      "default": "Enforce"
+    },
+    "AllowAuditOnlyInProduction": {
+      "type": "boolean",
+      "default": false
+    },
+    "ClockSkewSeconds": {
+      "description": "Tolerance applied to the `tier_exp` claim (PRD FR-ENT-04).",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 900,
+      "default": 300
+    },
+    "AdminBypass": {
+      "description": "When true, a token with claim admin == true passes every tier check (PRD FR-MAP-03 implies admins are never locked out).",
+      "type": "boolean",
+      "default": true
+    },
+    "Tiers": {
+      "description": "Tier name -> rank. Ranks MUST be unique. The tier with the lowest rank is the default tier for users without a valid claim.",
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/TierName" },
+      "additionalProperties": { "type": "integer", "minimum": 0, "maximum": 100 }
+    },
+    "Features": {
+      "description": "Feature key -> minimum tier name. Every value MUST be a key of `Tiers`.",
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/FeatureKey" },
+      "additionalProperties": { "$ref": "#/$defs/TierName" }
+    },
+    "Routes": {
+      "description": "Gated entry routes. Only these are tier-checked (PRD FR-MAP-02). Every `Feature` MUST be a key of `Features`.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/RouteRule" }
+    }
+  },
+  "$defs": {
+    "TierName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+    },
+    "FeatureKey": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+    },
+    "RouteRule": {
+      "type": "object",
+      "required": ["Method", "PathPattern", "Feature"],
+      "additionalProperties": false,
+      "properties": {
+        "Method": {
+          "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]
+        },
+        "PathPattern": {
+          "description": "ASP.NET Core route template matched case-insensitively against the request path with TemplateMatcher (trailing slash tolerant). Use `v{version}` so every API version is covered, e.g. `/api/v{version}/sessions/{sessionId}/devices`.",
+          "type": "string",
+          "pattern": "^/[A-Za-z0-9_{}./:*?-]*$",
+          "maxLength": 200
+        },
+        "Feature": { "$ref": "#/$defs/FeatureKey" }
+      }
+    },
+    "FeatureMapDocument": {
+      "title": "Public feature map (GET /api/v1/features, app embedded copy)",
+      "type": "object",
+      "required": ["schemaVersion", "defaultTier", "tiers", "features"],
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "defaultTier": { "$ref": "#/$defs/TierName" },
+        "tiers": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/TierName" },
+          "additionalProperties": { "type": "integer", "minimum": 0, "maximum": 100 }
+        },
+        "features": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/FeatureKey" },
+          "additionalProperties": { "$ref": "#/$defs/TierName" }
+        }
+      }
+    }
+  },
+  "x-lsc-semantic-rules": [
+    "S1: Tier ranks are unique (fail startup).",
+    "S2: Every Features value is a key of Tiers (fail startup).",
+    "S3: Every Routes[].Feature is a key of Features (fail startup).",
+    "S4: Every Routes[].PathPattern parses as a route template (fail startup).",
+    "S5: No two Routes entries have the same Method and equivalent PathPattern (fail startup).",
+    "S6: At runtime a route whose feature cannot be resolved is denied for everyone except admin and logged at Error (PRD FR-MAP-03).",
+    "S7: Clients treat unknown feature keys as locked and unknown tiers as the default tier."
+  ],
+  "examples": [
+    {
+      "EnforcementMode": "Enforce",
+      "ClockSkewSeconds": 300,
+      "AdminBypass": true,
+      "Tiers": { "free": 0, "premium": 1 },
+      "Features": {
+        "scoring.local": "free",
+        "streaming.youtube": "premium",
+        "sessions.remote.host": "premium",
+        "sessions.remote.join": "free"
+      },
+      "Routes": [
+        { "Method": "POST", "PathPattern": "/api/v{version}/broadcasts", "Feature": "streaming.youtube" },
+        { "Method": "POST", "PathPattern": "/api/v{version}/sessions", "Feature": "sessions.remote.host" },
+        { "Method": "GET", "PathPattern": "/api/v{version}/sessions", "Feature": "sessions.remote.join" },
+        { "Method": "POST", "PathPattern": "/api/v{version}/sessions/{sessionId}/devices", "Feature": "sessions.remote.join" }
+      ]
+    }
+  ]
+}

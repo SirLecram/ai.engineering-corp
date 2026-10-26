@@ -1,0 +1,448 @@
+openapi: 3.1.0
+info:
+  title: LSC Gateway API - premium tiers delta
+  version: 1.1.0
+  summary: New and changed public Gateway endpoints for premium/free tiers (LiveScoreCounter.Api, src/LSC.Gateway).
+  description: |
+    This document is a **delta** over the existing LSC Gateway API (`LSC.Gateway.WebApi`, generated OpenAPI). It contains:
+
+    1. **New endpoints** used by the Android phone app: feature map, user provisioning, entitlement, sync, admin.
+       Except `/api/v1/features` (served by the Gateway from its own `TierAuthorization` config) they proxy to
+       IdentityService / SubscriptionService using typed clients from `LSC.Identity.Client` / `LSC.Subscriptions.Client`
+       with the caller's `Authorization` and `X-Correlation-Id` headers propagated. The upstream paths are identical.
+    2. **Changed existing endpoints**: only the tier-gated *entry* routes listed in the default
+       `TierAuthorization:routes` config gain a `403 tier-required` response. Request and success bodies are unchanged
+       (see `LSC.StreamPlatformManagement.Dto` / `LSC.RemoteSessions.Dto`); they are shown as opaque objects here.
+       Continuation routes (scores, end/leave session, broadcast status/prepare/statistics/delete, stream delete, `/hubs/**`)
+       are NOT gated (PRD FR-MAP-02, D6).
+
+    The tier check is client-agnostic: it applies to every caller of the Gateway, whatever the client.
+
+    Route matching is configuration driven (`{ method, pathPattern, feature }`, ASP.NET route-template syntax such as
+    `/api/v{version}/sessions`), so the operator can change gating without code changes. The `x-lsc-tier-feature`
+    extension below documents the **default** configuration only.
+
+    Frozen for implementation of PRD `docs/prd/premium-tiers.md` v1.1. Architecture: `docs/architecture/premium-tiers.md`.
+  license:
+    name: Proprietary - internal use only
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: https://api.livescorecounter.app
+    description: Public origin behind nginx (placeholder - owner to confirm domain and TLS; today the app uses plain HTTP to the VM IP)
+  - url: http://localhost:5266
+    description: Local development
+security:
+  - FirebaseBearer: []
+tags:
+  - name: Features
+  - name: Users
+  - name: Entitlement
+  - name: Admin
+  - name: Gated existing endpoints
+
+paths:
+  /api/v1/features:
+    get:
+      tags: [Features]
+      operationId: getFeatureMap
+      summary: Tiers and feature -> minimum tier map (PRD FR-MAP-04). No route list.
+      description: >-
+        Served from in-memory config. Strong `ETag` = hash of the canonical JSON; `If-None-Match` -> 304.
+        Response header `Cache-Control` is `private, max-age=900`.
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          schema:
+            type: string
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Feature map.
+          headers:
+            ETag:
+              $ref: './lsc-common.openapi.yaml#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: './lsc-common.openapi.yaml#/components/schemas/FeatureMapDocument'
+        '304':
+          description: Not modified.
+          headers:
+            ETag:
+              $ref: './lsc-common.openapi.yaml#/components/headers/ETag'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+
+  /api/v1/users/me:
+    post:
+      tags: [Users]
+      operationId: provisionMe
+      summary: Idempotent sign-in/sign-up provisioning (PRD FR-USR-01/02).
+      description: |
+        Gateway orchestration (MediatR command `ProvisionCurrentUserCommand`):
+        1. IdentityService `POST /api/v1/users/me` - required; its failure fails the call (503).
+        2. SubscriptionService `POST /api/v1/subscriptions/provision` - best effort with a 3 s timeout; on failure
+           `entitlement` is `null` and the app falls back to `GET /api/v1/me/entitlement` later. Never blocks the user (D10).
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Provisioned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProvisionMeResult'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /api/v1/me/entitlement:
+    get:
+      tags: [Entitlement]
+      operationId: getMyEntitlement
+      summary: Stored entitlement + per-feature unlock flags (PRD FR-ENT-06).
+      description: Proxied to SubscriptionService; the Gateway fills `features` from its feature map using the stored tier (not the token).
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Entitlement.
+          content:
+            application/json:
+              schema:
+                $ref: './lsc-common.openapi.yaml#/components/schemas/EntitlementStatus'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /api/v1/subscriptions/sync:
+    post:
+      tags: [Entitlement]
+      operationId: syncMySubscription
+      summary: App-triggered RevenueCat refetch (PRD FR-SYNC-01). Rate limit 6/min per UID at the Gateway.
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Sync result with `features`. If `tierChanged`, force-refresh the ID token before any gated call.
+          content:
+            application/json:
+              schema:
+                $ref: './lsc-common.openapi.yaml#/components/schemas/SyncResult'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '429':
+          $ref: './lsc-common.openapi.yaml#/components/responses/TooManyRequests'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /api/v1/admin/users/{uid}/grants:
+    post:
+      tags: [Admin]
+      operationId: adminGrantPromotional
+      summary: Promotional premium grant (PRD FR-ADM-01). Requires claim `admin == true`.
+      x-lsc-requires-claim: admin
+      x-lsc-upstream: subscription-service.openapi.yaml#/paths/~1api~1v1~1admin~1users~1{uid}~1grants/post
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/Uid'
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './subscription-service.openapi.yaml#/components/schemas/GrantRequest'
+      responses:
+        '200':
+          description: Grant applied.
+          content:
+            application/json:
+              schema:
+                $ref: './subscription-service.openapi.yaml#/components/schemas/AdminEntitlementResult'
+        '400':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: './lsc-common.openapi.yaml#/components/responses/NotFound'
+        '429':
+          $ref: './lsc-common.openapi.yaml#/components/responses/TooManyRequests'
+        '502':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadGateway'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /api/v1/admin/users/{uid}/grants/revoke:
+    post:
+      tags: [Admin]
+      operationId: adminRevokePromotional
+      summary: Revoke promotional entitlements (PRD FR-ADM-02). Requires claim `admin == true`.
+      x-lsc-requires-claim: admin
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/Uid'
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './subscription-service.openapi.yaml#/components/schemas/ReasonRequest'
+      responses:
+        '200':
+          description: Revoked.
+          content:
+            application/json:
+              schema:
+                $ref: './subscription-service.openapi.yaml#/components/schemas/RevokeResult'
+        '400':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: './lsc-common.openapi.yaml#/components/responses/NotFound'
+        '502':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadGateway'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /api/v1/admin/users/{uid}/entitlement:
+    get:
+      tags: [Admin]
+      operationId: adminGetUserEntitlement
+      summary: Inspect a user's entitlement, audit and webhook history (PRD FR-ADM-03).
+      x-lsc-requires-claim: admin
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/Uid'
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Inspection data.
+          content:
+            application/json:
+              schema:
+                $ref: './subscription-service.openapi.yaml#/components/schemas/AdminUserInspection'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: './lsc-common.openapi.yaml#/components/responses/NotFound'
+
+  /api/v1/admin/users/{uid}/resync:
+    post:
+      tags: [Admin]
+      operationId: adminResyncUser
+      summary: Force RevenueCat refetch for a user (PRD FR-ADM-04).
+      x-lsc-requires-claim: admin
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/Uid'
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './subscription-service.openapi.yaml#/components/schemas/ReasonRequest'
+      responses:
+        '200':
+          description: Resynced.
+          content:
+            application/json:
+              schema:
+                $ref: './subscription-service.openapi.yaml#/components/schemas/AdminEntitlementResult'
+        '400':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: './lsc-common.openapi.yaml#/components/responses/NotFound'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /api/v1/admin/webhooks/{eventId}/replay:
+    post:
+      tags: [Admin]
+      operationId: adminReplayWebhook
+      summary: Re-queue a failed or dead-lettered webhook event (PRD FR-ADM-04).
+      x-lsc-requires-claim: admin
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 100
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './subscription-service.openapi.yaml#/components/schemas/ReasonRequest'
+      responses:
+        '202':
+          description: Re-queued.
+          content:
+            application/json:
+              schema:
+                $ref: './subscription-service.openapi.yaml#/components/schemas/WebhookEventSummary'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: './lsc-common.openapi.yaml#/components/responses/NotFound'
+        '409':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Conflict'
+
+  /api/v1/broadcasts:
+    post:
+      tags: [Gated existing endpoints]
+      operationId: createBroadcast
+      summary: EXISTING - create YouTube broadcast + stream. Now gated.
+      x-lsc-tier-feature: streaming.youtube
+      parameters:
+        - name: X-YouTube-Access-Token
+          in: header
+          required: true
+          description: Existing header (unchanged).
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnchangedBody'
+      responses:
+        '200':
+          description: Unchanged (`CreateBroadcastResult`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnchangedBody'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/TierRequired'
+
+  /api/v1/sessions:
+    post:
+      tags: [Gated existing endpoints]
+      operationId: initializeSession
+      summary: EXISTING - create a remote session and pairing code (host). Now gated.
+      x-lsc-tier-feature: sessions.remote.host
+      parameters:
+        - name: X-SignalR-ConnectionId
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnchangedBody'
+      responses:
+        '200':
+          description: Unchanged (`MatchSessionDto`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnchangedBody'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/TierRequired'
+    get:
+      tags: [Gated existing endpoints]
+      operationId: getSessionByPairingCode
+      summary: EXISTING - resolve a pairing code (first step of joining). Gated by the join feature (free by default).
+      x-lsc-tier-feature: sessions.remote.join
+      parameters:
+        - name: pairingCode
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Unchanged (`SessionIdDto`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnchangedBody'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/TierRequired'
+
+  /api/v1/sessions/{sessionId}/devices:
+    post:
+      tags: [Gated existing endpoints]
+      operationId: joinSession
+      summary: EXISTING - join a session as a controller. Gated by the join feature (free by default, PRD D7).
+      x-lsc-tier-feature: sessions.remote.join
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: X-SignalR-ConnectionId
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnchangedBody'
+      responses:
+        '200':
+          description: Unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnchangedBody'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/TierRequired'
+
+components:
+  securitySchemes:
+    FirebaseBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: Firebase ID token (JWT)
+  schemas:
+    UnchangedBody:
+      type: object
+      description: Existing request/response body, unchanged by this feature. See the existing DTO packages.
+      additionalProperties: true
+    ProvisionMeResult:
+      type: object
+      required: [user]
+      properties:
+        user:
+          $ref: './identity-service.openapi.yaml#/components/schemas/UserProfile'
+        entitlement:
+          description: Entitlement with `features`, or null if SubscriptionService did not answer in time.
+          oneOf:
+            - $ref: './lsc-common.openapi.yaml#/components/schemas/EntitlementStatus'
+            - type: 'null'

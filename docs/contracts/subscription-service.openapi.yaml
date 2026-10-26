@@ -1,0 +1,656 @@
+openapi: 3.1.0
+info:
+  title: LSC Subscriptions API (SubscriptionService)
+  version: 1.0.0
+  summary: RevenueCat webhook receiver, entitlement store, app sync and admin grant APIs (PRD FR-ENT, FR-WH, FR-SYNC, FR-ADM).
+  description: |
+    Repository `SirLecram/LiveScoreCounter.Users`, solution `src/LSC.Subscriptions`, image `ghcr.io/sirlecram/lsc-subscriptions`.
+
+    **Exposure.**
+    * `POST /webhooks/revenuecat` is the only path routed by nginx directly to this service (`location = /webhooks/revenuecat`,
+      `limit_req` 20 r/s burst 50, `client_max_body_size 256k`). Authenticated with the RevenueCat webhook bearer secret.
+    * `/api/v1/**` is reachable only from the API Gateway on `internal-net`. The Gateway forwards the caller's Firebase ID token;
+      this service validates it again (defense in depth) and takes the UID from `sub`. The paths are identical to the Gateway
+      paths so that the published `LSC.Subscriptions.Client` package works against either base URL (same pattern as
+      `LSC.RemoteSessions.Client`).
+    * Admin routes require the Firebase custom claim `admin == true` (checked here and in the Gateway).
+
+    **Entitlement rule (PRD FR-ENT-02, D1).** Every trigger (webhook, sync, reconcile, admin) refetches
+    `GET https://api.revenuecat.com/v1/subscribers/{app_user_id}` and recomputes. The user is `premium` iff entitlement `premium`
+    exists with `expires_date` null or in the future. Webhook payloads are never applied as deltas.
+
+    Frozen for implementation of PRD `docs/prd/premium-tiers.md` v1.1. Architecture: `docs/architecture/premium-tiers.md`.
+  license:
+    name: Proprietary - internal use only
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: http://subscriptions:8080
+    description: Docker internal-net (compose service `subscriptions`, container `lsc-subscriptions`)
+  - url: https://api.livescorecounter.app
+    description: Public origin for the webhook path only (placeholder host - owner to confirm domain, see open questions)
+  - url: http://localhost:5320
+    description: Local development
+tags:
+  - name: Webhooks
+  - name: Entitlement
+  - name: Admin
+  - name: Health
+
+paths:
+  /webhooks/revenuecat:
+    post:
+      tags: [Webhooks]
+      operationId: receiveRevenueCatWebhook
+      summary: Receive a RevenueCat webhook event (PRD FR-WH-01..08).
+      description: |
+        Order of checks: body size (> 256 KB -> 413, enforced by nginx and Kestrel), `Authorization: Bearer <secret>`
+        (constant-time; missing or wrong -> 401, nothing persisted, warning logged without the header), JSON + schema
+        (-> 400), then `INSERT ... ON CONFLICT (event_id) DO NOTHING` into `subscription.webhook_events`.
+
+        The response is sent after the row is committed (durable, p95 <= 500 ms). Processing happens asynchronously in the
+        background worker: refetch RevenueCat -> recompute entitlement -> push claims to IdentityService -> audit.
+
+        Classification at ingest (always 200, so RevenueCat stops retrying):
+        * duplicate `event.id` -> `duplicate`, not reprocessed;
+        * `environment == SANDBOX` while `RevenueCat:AcceptSandbox == false` -> `ignored_sandbox`;
+        * `app_user_id` starting with `$RCAnonymousID:` -> `ignored_anonymous`;
+        * `type == TEST` -> `ignored_test`;
+        * anything else, including unknown future types -> `accepted`.
+        `TRANSFER` events enqueue a recompute for every UID in `transferred_from` and `transferred_to`.
+
+        Any 5xx makes RevenueCat retry (RevenueCat-side retry policy); the inbox makes those retries idempotent.
+      security:
+        - RevenueCatWebhookBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevenueCatWebhook'
+            examples:
+              initialPurchase:
+                value:
+                  api_version: '1.0'
+                  event:
+                    id: 7d3c2f9a-1b2c-4d5e-8f90-a1b2c3d4e5f6
+                    type: INITIAL_PURCHASE
+                    app_user_id: Xq3b8Zt1nVd0h2Kp
+                    original_app_user_id: Xq3b8Zt1nVd0h2Kp
+                    aliases: [Xq3b8Zt1nVd0h2Kp]
+                    environment: PRODUCTION
+                    event_timestamp_ms: 1793008800000
+                    product_id: lsc_premium_monthly
+                    entitlement_ids: [premium]
+                    period_type: NORMAL
+                    purchased_at_ms: 1793008790000
+                    expiration_at_ms: 1795687190000
+                    store: PLAY_STORE
+              transfer:
+                value:
+                  api_version: '1.0'
+                  event:
+                    id: 0b1e7c3d-2f4a-4b6c-9d8e-112233445566
+                    type: TRANSFER
+                    environment: PRODUCTION
+                    event_timestamp_ms: 1793008800000
+                    store: PLAY_STORE
+                    transferred_from: [OldUid123]
+                    transferred_to: [NewUid456]
+      responses:
+        '200':
+          description: Event stored (or recognised as duplicate / ignored).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+        '400':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadRequest'
+        '401':
+          description: Missing or invalid webhook secret. Nothing persisted.
+          content:
+            application/problem+json:
+              schema:
+                $ref: './lsc-common.openapi.yaml#/components/schemas/ProblemDetails'
+        '413':
+          description: Body larger than 256 KB.
+          content:
+            application/problem+json:
+              schema:
+                $ref: './lsc-common.openapi.yaml#/components/schemas/ProblemDetails'
+        '415':
+          description: Content-Type is not `application/json`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: './lsc-common.openapi.yaml#/components/schemas/ProblemDetails'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /api/v1/subscriptions/provision:
+    post:
+      tags: [Entitlement]
+      operationId: provisionCurrentSubscriber
+      summary: Ensure an entitlement row and RevenueCat customer exist for the caller (PRD FR-USR-01/02).
+      description: |
+        Called best-effort by the Gateway as part of `POST /api/v1/users/me`. Creates the entitlement row (`free`,
+        `provisioningState=pending`) if missing, then calls RevenueCat `GET /v1/subscribers/{uid}` (which creates the customer).
+        A RevenueCat failure does NOT fail the call: the row stays `pending`/`failed` and the reconciliation job retries (D10).
+        Every other authenticated endpoint also lazily creates the row, so a lost provision call is harmless.
+      security:
+        - FirebaseBearer: []
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Current entitlement (without `features`).
+          content:
+            application/json:
+              schema:
+                $ref: './lsc-common.openapi.yaml#/components/schemas/EntitlementStatus'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /api/v1/me/entitlement:
+    get:
+      tags: [Entitlement]
+      operationId: getMyEntitlement
+      summary: Stored entitlement of the caller (PRD FR-ENT-06). No RevenueCat call on this path.
+      security:
+        - FirebaseBearer: []
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Entitlement (without `features`; the Gateway adds them).
+          content:
+            application/json:
+              schema:
+                $ref: './lsc-common.openapi.yaml#/components/schemas/EntitlementStatus'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /api/v1/subscriptions/sync:
+    post:
+      tags: [Entitlement]
+      operationId: syncMySubscription
+      summary: Synchronously refetch RevenueCat, recompute, push claims (PRD FR-SYNC-01). Own UID only.
+      description: |
+        Same code path and per-UID lock as webhook processing. p95 <= 3 s. The per-UID limit of 6/min is enforced at the
+        Gateway; this service additionally applies a global limiter that protects the RevenueCat API quota.
+        If RevenueCat is unavailable -> 503 and nothing changes. If RevenueCat succeeded but IdentityService/Firebase did not,
+        the entitlement is saved and the response has `claimsPending=true` (the claim push is retried by the worker).
+      security:
+        - FirebaseBearer: []
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Sync completed.
+          content:
+            application/json:
+              schema:
+                $ref: './lsc-common.openapi.yaml#/components/schemas/SyncResult'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '429':
+          $ref: './lsc-common.openapi.yaml#/components/responses/TooManyRequests'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /api/v1/admin/users/{uid}/grants:
+    post:
+      tags: [Admin]
+      operationId: adminGrantPromotional
+      summary: Grant a RevenueCat promotional `premium` entitlement (PRD FR-ADM-01, D11).
+      description: |
+        Calls RevenueCat `POST /v1/subscribers/{uid}/entitlements/premium/promotional` with `duration`, then runs the sync flow
+        with cause `admin:<adminUid>`. Writes a `subscription.admin_actions` row (admin UID, reason, outcome) and, on change, an
+        `entitlement_audit` row. The UID must already be known (entitlement row exists), otherwise 404 - this prevents creating
+        RevenueCat customers for mistyped UIDs.
+      security:
+        - FirebaseBearer: []
+      x-lsc-requires-claim: admin
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/Uid'
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GrantRequest'
+      responses:
+        '200':
+          description: Grant applied; resulting entitlement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminEntitlementResult'
+        '400':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: './lsc-common.openapi.yaml#/components/responses/NotFound'
+        '502':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadGateway'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /api/v1/admin/users/{uid}/grants/revoke:
+    post:
+      tags: [Admin]
+      operationId: adminRevokePromotional
+      summary: Revoke promotional entitlements only (PRD FR-ADM-02).
+      description: |
+        Calls RevenueCat `POST /v1/subscribers/{uid}/entitlements/premium/revoke_promotionals`, then syncs. Store purchases are
+        not affected (refunds go through Play Console). `stillPremiumViaStore` tells the admin whether the user keeps premium.
+      security:
+        - FirebaseBearer: []
+      x-lsc-requires-claim: admin
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/Uid'
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonRequest'
+      responses:
+        '200':
+          description: Revocation applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevokeResult'
+        '400':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: './lsc-common.openapi.yaml#/components/responses/NotFound'
+        '502':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadGateway'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /api/v1/admin/users/{uid}/entitlement:
+    get:
+      tags: [Admin]
+      operationId: adminGetUserEntitlement
+      summary: Entitlement + last 50 audit rows + last 20 webhook events for a UID (PRD FR-ADM-03).
+      security:
+        - FirebaseBearer: []
+      x-lsc-requires-claim: admin
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/Uid'
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Inspection data. Webhook payloads are not returned (only metadata).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserInspection'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: './lsc-common.openapi.yaml#/components/responses/NotFound'
+
+  /api/v1/admin/users/{uid}/resync:
+    post:
+      tags: [Admin]
+      operationId: adminResyncUser
+      summary: Force a RevenueCat refetch and claim push for a UID (PRD FR-ADM-04).
+      security:
+        - FirebaseBearer: []
+      x-lsc-requires-claim: admin
+      parameters:
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/Uid'
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonRequest'
+      responses:
+        '200':
+          description: Resync completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminEntitlementResult'
+        '400':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: './lsc-common.openapi.yaml#/components/responses/NotFound'
+        '503':
+          $ref: './lsc-common.openapi.yaml#/components/responses/ServiceUnavailable'
+
+  /api/v1/admin/webhooks/{eventId}/replay:
+    post:
+      tags: [Admin]
+      operationId: adminReplayWebhook
+      summary: Re-queue a `failed` or `dead_letter` webhook event (PRD FR-ADM-04, FR-WH-06).
+      description: Resets `attempts` to 0 and `next_attempt_at` to now. Other statuses -> 409.
+      security:
+        - FirebaseBearer: []
+      x-lsc-requires-claim: admin
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          description: RevenueCat `event.id`.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 100
+        - $ref: './lsc-common.openapi.yaml#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonRequest'
+      responses:
+        '202':
+          description: Event re-queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookEventSummary'
+        '400':
+          $ref: './lsc-common.openapi.yaml#/components/responses/BadRequest'
+        '401':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Unauthorized'
+        '403':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Forbidden'
+        '404':
+          $ref: './lsc-common.openapi.yaml#/components/responses/NotFound'
+        '409':
+          $ref: './lsc-common.openapi.yaml#/components/responses/Conflict'
+
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: getLiveness
+      security: []
+      responses:
+        '200':
+          description: Alive.
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: getReadiness
+      summary: Database checked (Unhealthy -> 503). RevenueCat and IdentityService reported as Degraded only (PRD NFR-06).
+      security: []
+      responses:
+        '200':
+          description: Healthy or Degraded.
+        '503':
+          description: Unhealthy.
+  /metrics:
+    get:
+      tags: [Health]
+      operationId: getMetrics
+      summary: Prometheus text exposition. Internal network only (nginx never routes it).
+      security: []
+      responses:
+        '200':
+          description: Metrics.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    FirebaseBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: Firebase ID token (JWT), forwarded by the Gateway
+    RevenueCatWebhookBearer:
+      type: http
+      scheme: bearer
+      description: |
+        Static secret configured in the RevenueCat dashboard "Authorization header" field as `Bearer <secret>` and in the
+        `RevenueCat__WebhookAuthToken` Docker secret (>= 32 chars, startup refuses weaker values in Production).
+  schemas:
+    RevenueCatEventType:
+      type: string
+      description: Known RevenueCat event types. Unknown values MUST be accepted (forward compatible).
+      examples:
+        - INITIAL_PURCHASE
+        - RENEWAL
+        - PRODUCT_CHANGE
+        - CANCELLATION
+        - UNCANCELLATION
+        - NON_RENEWING_PURCHASE
+        - EXPIRATION
+        - BILLING_ISSUE
+        - SUBSCRIPTION_PAUSED
+        - SUBSCRIPTION_EXTENDED
+        - TEMPORARY_ENTITLEMENT_GRANT
+        - REFUND_REVERSED
+        - TRANSFER
+        - TEST
+    RevenueCatEvent:
+      type: object
+      description: Subset of the RevenueCat webhook event used by this service. The raw JSON is stored verbatim (jsonb) for 90 days.
+      required: [id, type]
+      additionalProperties: true
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 100
+        type:
+          $ref: '#/components/schemas/RevenueCatEventType'
+        app_user_id:
+          type: string
+          maxLength: 128
+        original_app_user_id:
+          type: string
+        aliases:
+          type: array
+          items:
+            type: string
+        transferred_from:
+          type: array
+          items:
+            type: string
+        transferred_to:
+          type: array
+          items:
+            type: string
+        environment:
+          type: string
+          enum: [PRODUCTION, SANDBOX]
+        event_timestamp_ms:
+          type: integer
+          format: int64
+        product_id:
+          type: string
+        entitlement_ids:
+          type: [array, 'null']
+          items:
+            type: string
+        period_type:
+          type: string
+        purchased_at_ms:
+          type: [integer, 'null']
+          format: int64
+        expiration_at_ms:
+          type: [integer, 'null']
+          format: int64
+        store:
+          type: string
+        cancel_reason:
+          type: [string, 'null']
+        expiration_reason:
+          type: [string, 'null']
+    RevenueCatWebhook:
+      type: object
+      required: [event]
+      additionalProperties: true
+      properties:
+        api_version:
+          type: string
+        event:
+          $ref: '#/components/schemas/RevenueCatEvent'
+    WebhookIngestStatus:
+      type: string
+      enum: [accepted, duplicate, ignored_sandbox, ignored_anonymous, ignored_test]
+    WebhookAck:
+      type: object
+      required: [eventId, status]
+      properties:
+        eventId:
+          type: string
+        status:
+          $ref: '#/components/schemas/WebhookIngestStatus'
+    WebhookProcessingStatus:
+      type: string
+      description: Lifecycle status of an inbox row.
+      enum: [received, processing, processed, failed, dead_letter, ignored_sandbox, ignored_anonymous, ignored_test]
+    WebhookEventSummary:
+      type: object
+      required: [eventId, type, status, attempts, receivedAt]
+      properties:
+        eventId:
+          type: string
+        type:
+          type: string
+        appUserId:
+          type: [string, 'null']
+        environment:
+          type: [string, 'null']
+        status:
+          $ref: '#/components/schemas/WebhookProcessingStatus'
+        attempts:
+          type: integer
+          minimum: 0
+          maximum: 8
+        nextAttemptAt:
+          type: [string, 'null']
+          format: date-time
+        lastError:
+          type: [string, 'null']
+          maxLength: 1000
+        receivedAt:
+          type: string
+          format: date-time
+        processedAt:
+          type: [string, 'null']
+          format: date-time
+    PromotionalDuration:
+      type: string
+      enum: [daily, three_day, weekly, monthly, two_month, three_month, six_month, yearly, lifetime]
+    ReasonRequest:
+      type: object
+      required: [reason]
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 500
+    GrantRequest:
+      type: object
+      required: [duration, reason]
+      additionalProperties: false
+      properties:
+        duration:
+          $ref: '#/components/schemas/PromotionalDuration'
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 500
+    AuditCause:
+      type: string
+      description: '`webhook:<eventType>:<eventId>` | `sync` | `reconcile` | `admin:<adminUid>`'
+      maxLength: 200
+    EntitlementAuditEntry:
+      type: object
+      required: [id, uid, oldTier, newTier, cause, createdAt]
+      properties:
+        id:
+          type: integer
+          format: int64
+        uid:
+          type: string
+        oldTier:
+          type: string
+        newTier:
+          type: string
+        oldExpiresAt:
+          type: [string, 'null']
+          format: date-time
+        newExpiresAt:
+          type: [string, 'null']
+          format: date-time
+        oldVersion:
+          type: integer
+          format: int64
+        newVersion:
+          type: integer
+          format: int64
+        cause:
+          $ref: '#/components/schemas/AuditCause'
+        reason:
+          type: [string, 'null']
+        correlationId:
+          type: [string, 'null']
+        createdAt:
+          type: string
+          format: date-time
+    AdminEntitlementResult:
+      type: object
+      required: [entitlement, changed]
+      properties:
+        entitlement:
+          $ref: './lsc-common.openapi.yaml#/components/schemas/EntitlementStatus'
+        changed:
+          type: boolean
+        claimsPending:
+          type: boolean
+    RevokeResult:
+      allOf:
+        - $ref: '#/components/schemas/AdminEntitlementResult'
+        - type: object
+          required: [stillPremiumViaStore]
+          properties:
+            stillPremiumViaStore:
+              type: boolean
+    AdminUserInspection:
+      type: object
+      required: [entitlement, audit, webhookEvents]
+      properties:
+        entitlement:
+          $ref: './lsc-common.openapi.yaml#/components/schemas/EntitlementStatus'
+        audit:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/EntitlementAuditEntry'
+        webhookEvents:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/WebhookEventSummary'
