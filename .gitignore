@@ -1,0 +1,19 @@
+# Claude Code
+.claude/*
+!.claude/agents/
+!.claude/settings.json
+
+# .NET / C#
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# JetBrains / VS Code
+.idea/
+.vscode/
+
+# OS Specific
+.DS_Store
+Thumbs.db
