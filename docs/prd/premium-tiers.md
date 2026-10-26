@@ -4,22 +4,24 @@
 |---|---|
 | Source issue | SirLecram/LiveScoreCounter.App#27 - "Implement a way to grant premium/free access and configure access to the app based on the tier the user has - license, pricing" |
 | Tracking branch | `feat/2-premium-tier-specs` |
-| Status | Draft v1.0 - written in autonomous mode (no interactive owner interview; see section 11) |
+| Status | Draft v1.1 - written in autonomous mode (no interactive owner interview; see section 11). v1.1: WearOS app removed from scope per owner instruction. |
 | Owner | Marcel Grzes (Product Owner / Admin) |
 | Billing provider | RevenueCat (entitlement id `premium`) |
 | Identity provider | Firebase Authentication |
-| Affected repos | `LiveScoreCounter.Users` (NEW: IdentityService, SubscriptionService), API Gateway, `LiveScoreCounter.App` (Android + WearOS), `LiveScoreCounter.Libraries` (shared tier-authorization NuGet), `LiveScoreCounter.DevOps` (docs only) |
+| Affected repos | `LiveScoreCounter.Users` (NEW: IdentityService, SubscriptionService), API Gateway, `LiveScoreCounter.App` (Android phone app only), `LiveScoreCounter.Libraries` (shared tier-authorization NuGet), `LiveScoreCounter.DevOps` (docs only) |
 
 ---
 
 ## 1. Summary
 
-LiveScoreCounter is an Android .NET MAUI scoreboard app (plus a WearOS companion). Its backend services (API Gateway, Stream Platform Mgmt, Remote Sessions) run behind nginx on an Oracle VM and use Firebase Auth. Today every signed-in user has access to every feature. This PRD adds two tiers:
+LiveScoreCounter is an Android .NET MAUI scoreboard app. Its backend services (API Gateway, Stream Platform Mgmt, Remote Sessions) run behind nginx on an Oracle VM and use Firebase Auth. Today every signed-in user has access to every feature. This PRD adds two tiers:
 
 - **Free**: local scoring only. Works offline and never needs the backend.
-- **Premium** (paid subscription through Google Play, billed via RevenueCat): YouTube streaming/broadcast and remote sessions/pairing, including the WearOS controller.
+- **Premium** (paid subscription through Google Play, billed via RevenueCat): YouTube streaming/broadcast and remote sessions/pairing.
 
-Gating is driven by a **configurable feature -> minimum-tier map**. The tier assignments above are the defaults; the map is not hardcoded. RevenueCat is the source of truth for purchases. The new **SubscriptionService** turns RevenueCat state into an internal entitlement record. The new **IdentityService** mirrors that record into Firebase custom claims. The **API Gateway** enforces the map on each request using only the verified ID-token claims. The app enforces the same map in the UI and shows a paywall for locked features.
+Gating is driven by a **configurable feature -> minimum-tier map**. The tier assignments above are the defaults; the map is not hardcoded. RevenueCat is the source of truth for purchases. The new **SubscriptionService** turns RevenueCat state into an internal entitlement record. The new **IdentityService** mirrors that record into Firebase custom claims. The **API Gateway** enforces the map on each request using only the verified ID-token claims. The Android phone app enforces the same map in the UI and shows a paywall for locked features.
+
+The WearOS companion app is **out of scope** for this feature (section 10).
 
 ## 2. Goals and Success Metrics
 
@@ -49,8 +51,8 @@ Gating is driven by a **configurable feature -> minimum-tier map**. The tier ass
 | Persona | Description | Primary need |
 |---|---|---|
 | P1 Free Scorer | Parent or amateur referee keeping score on one phone, often without connectivity in sports halls. | Scoring always works, with no nagging when offline. |
-| P2 Premium Broadcaster | Club volunteer streaming matches to YouTube from a phone, controlling score from a WearOS watch or second phone. | Pay once per period, unlock instantly, and have nothing break mid-match. |
-| P3 Session Joiner | Helper who joins a premium broadcaster's session from another phone or a watch using a pairing code. May be a free user. | Join without buying anything. |
+| P2 Premium Broadcaster | Club volunteer streaming matches to YouTube from a phone, controlling score from a second phone. | Pay once per period, unlock instantly, and have nothing break mid-match. |
+| P3 Session Joiner | Helper who joins a premium broadcaster's session from another phone using a pairing code. May be a free user. | Join without buying anything. |
 | P4 Lapsed Subscriber | Former premium user whose subscription expired, was cancelled or refunded. | Clear messaging and an easy resubscribe path. |
 | P5 Owner/Admin | Product owner handling support, testers, promotions and refunds. | Grant or revoke premium per user with an audit trail. |
 | P6 Operator | Runs the Docker stack on the Oracle VM. | Health checks, logs, metrics, alerts, documented config and secrets. |
@@ -73,10 +75,10 @@ Gating is driven by a **configurable feature -> minimum-tier map**. The tier ass
 |---|---|---|---|
 | `scoring.local` | Local scoreboard, scoring, reset, local overlay preview | `free` | Client only (never touches backend) |
 | `streaming.youtube` | Create a YouTube broadcast, start an RTMP stream, "Go Live" | `premium` | Gateway (entry routes of Stream Platform Mgmt) + client UI |
-| `sessions.remote.host` | Create a remote session, generate a pairing code, pair a WearOS/phone controller | `premium` | Gateway (entry routes of Remote Sessions) + client UI |
-| `sessions.remote.join` | Join an existing session by pairing code and send score updates as a controller | `free` | Gateway + client UI |
+| `sessions.remote.host` | Create a remote session, generate a pairing code, pair a controller phone | `premium` | Gateway (entry routes of Remote Sessions) + client UI |
+| `sessions.remote.join` | Join an existing session by pairing code from a phone and send score updates as a controller | `free` | Gateway + client UI |
 
-The owner chose "premium = remote sessions/pairing". It is enforced on the **host** (`sessions.remote.host`): the person who creates the session and pairing code pays, and joiners (P3, WearOS) do not. Section 11, D7, explains why. To require premium for joiners too, change `sessions.remote.join` to `premium` in config.
+The owner chose "premium = remote sessions/pairing". It is enforced on the **host** (`sessions.remote.host`): the person who creates the session and pairing code pays, and joiners (P3) do not. Section 11, D7, explains why. To require premium for joiners too, change `sessions.remote.join` to `premium` in config.
 
 ## 5. Architecture Overview (normative)
 
@@ -185,7 +187,7 @@ Each flow below is an end-to-end component test using the fake RevenueCat client
   - Rate limit 6 requests/min per UID; excess -> 429 with `Retry-After`.
 - **FR-SYNC-02** The app calls sync after: a successful purchase, a successful restore, a RevenueCat SDK `CustomerInfo` update whose `premium` active state differs from the cached state, and the app returning to foreground when the cached `expiresAt` has passed. After a sync that changed the tier, the app MUST force-refresh the Firebase ID token (`forceRefresh: true`) before calling any gated route.
 
-### 6.7 Android app: paywall and gating UX (FR-APP)
+### 6.7 Android phone app: paywall and gating UX (FR-APP)
 
 - **FR-APP-01** An `IEntitlementService` (Application layer interface, Infrastructure implementation) exposes `CurrentTier`, `IsFeatureUnlocked(featureKey)` and `EntitlementChanged`. ViewModels use only this service, never RevenueCat types directly.
 - **FR-APP-02** An `IPurchasesService` abstraction wraps RevenueCat. It has two implementations:
@@ -221,8 +223,7 @@ Each flow below is an end-to-end component test using the fake RevenueCat client
   - When offline, premium entry points show "Requires internet connection" instead of the paywall, because premium features need the network.
   - The paywall is shown only when the server confirms `free` (or a 403 tier-required response is received).
 - **FR-APP-09 Server is authoritative.** If the UI thinks a feature is unlocked but the server returns 403 tier-required, the app runs sync once and retries the request once. If it is still 403, the app shows the paywall.
-- **FR-APP-10 WearOS.** The watch has no paywall or purchase UI. If pairing or session creation fails with 403 tier-required, the watch shows "Premium required on the phone that hosts the session". Joining an existing session follows `sessions.remote.join` (default free).
-- **FR-APP-11 Sign-out.** Sign-out clears the cached entitlement and feature map overrides and calls `Purchases.LogOut()`. The next user starts from server state.
+- **FR-APP-10 Sign-out.** Sign-out clears the cached entitlement and feature map overrides and calls `Purchases.LogOut()`. The next user starts from server state.
 
 ### 6.8 Admin / manual grant (FR-ADM)
 
@@ -299,15 +300,15 @@ Given I am live streaming with a remote session,
 When my premium expires or is revoked,
 Then the stream and session continue until I end them, and I see a non-blocking banner. Starting a new stream or session requires premium.
 
-**US-09 Watch joins premium host (P3)**
+**US-09 Phone joins premium host (P3)**
 Given a premium host created a session and shows a pairing code,
-When a free user or a WearOS watch joins with the code,
-Then the join succeeds and score updates from the controller are accepted.
+When a free user joins with the code from their phone,
+Then the join succeeds and score updates from the controller phone are accepted.
 
-**US-10 Free host tries to pair a watch (P1)**
+**US-10 Free host tries to create a session (P1)**
 Given I am free,
-When I try to create a remote session or pair my watch,
-Then the phone shows the paywall, and if attempted from the watch it shows "Premium required on the phone that hosts the session".
+When I try to create a remote session or pair a controller phone,
+Then the paywall opens, and if the call reaches the backend it returns 403 tier-required.
 
 **US-11 Admin promotional grant (P5)**
 Given I have the admin claim,
@@ -361,8 +362,8 @@ Then I remain premium during grace and see a "Fix payment" banner linking to Goo
 - [ ] AC-APP-03 Fake billing provider impossible in Release builds (FR-APP-02).
 - [ ] AC-APP-04 403 tier-required -> one sync+retry -> paywall (FR-APP-09).
 - [ ] AC-APP-05 Restore, Manage subscription, billing banner, "Premium until" shown correctly (FR-APP-06/07, FR-FLOW-03/06).
-- [ ] AC-APP-06 WearOS shows host-premium message on 403 (FR-APP-10).
-- [ ] AC-APP-07 Sign-out clears entitlement cache and calls `Purchases.LogOut` (FR-APP-11).
+- [ ] AC-APP-06 Sign-out clears entitlement cache and calls `Purchases.LogOut` (FR-APP-10).
+- [ ] AC-APP-07 No changes in the WearOS app project (diff check in PR review).
 - [ ] AC-ADM-01 Grant/revoke/inspect/resync/replay work and are audited with admin UID and reason (FR-ADM-01..04).
 - [ ] AC-ADM-02 Non-admin -> 403 on all admin routes; no HTTP path grants admin (FR-ADM-05).
 - [ ] AC-CON-01 OpenAPI 3.1 specs + feature-map schema in `/docs/contracts/`; contract tests pass (FR-CON-01).
@@ -425,6 +426,9 @@ Then I remain premium during grace and see a "Fix payment" banner linking to Goo
 
 ## 10. Out of Scope (v1)
 
+- **WearOS app** (owner instruction). There are no code, UI, test or contract changes in the WearOS project: no paywall, no tier messaging, no entitlement cache.
+  - Server-side gating (Gateway) is client-agnostic. Any WearOS call to a gated entry route is subject to the same map, but WearOS behaviour is neither specified nor tested in v1.
+  - A follow-up issue should define WearOS behaviour (see O6).
 - iOS / App Store, web or Stripe purchases. One-time "lifetime" store products (lifetime is possible only via admin promotional grant).
 - More than two tiers in the product. Per-feature add-on purchases. Usage-based limits (for example "3 free streams/month").
 - Admin web UI or dashboard. Customer self-service refunds. In-app cancellation.
@@ -437,7 +441,7 @@ Then I remain premium during grace and see a "Fix payment" banner linking to Goo
 
 ## 11. Assumptions & Decisions
 
-### 11.1 Decisions (made autonomously; owner may override)
+### 11.1 Decisions (made autonomously unless marked as owner instruction)
 
 | ID | Decision | Rationale |
 |---|---|---|
@@ -447,7 +451,7 @@ Then I remain premium during grace and see a "Fix payment" banner linking to Goo
 | D4 | The API Gateway is the enforcement point. It decides from the token only, through a shared NuGet `LSC.Authorization.Tiers`. | Matches the diagram ("API Gateway ... validates subscription status"), adds no per-request network calls, and Users-service outages don't affect streaming. |
 | D5 | Revocation lag (refund/admin revoke) is accepted as <= ID-token lifetime (60 min). Natural expiry gets a 6 h `tier_exp` buffer. | Avoids forcing re-login on every device (refresh-token revocation) and avoids a deny-list. The buffer absorbs renewal-webhook delays. The commercial risk (<= 1 h of streaming after a refund) is negligible. |
 | D6 | Gating applies to entry operations only; running streams and sessions are never killed. | Cutting a live match broadcast is the worst UX for P2. Continuation is cheap. |
-| D7 | Remote sessions are gated on the host (`sessions.remote.host`); joining (`sessions.remote.join`) is free by default. | The paying broadcaster owns the session. Helpers and watches should not each need a subscription. Config can flip it (US-14). |
+| D7 | Remote sessions are gated on the host (`sessions.remote.host`); joining (`sessions.remote.join`) is free by default. | The paying broadcaster owns the session, and helpers should not each need a subscription. Config can flip it (US-14). |
 | D8 | App-triggered `POST /subscriptions/sync` in addition to webhooks. | Meets M1 (<= 15 s unlock) without depending on webhook latency. |
 | D9 | RevenueCat transfer behaviour is "Keep with original App User ID". Purchases require a signed-in Firebase user (no anonymous purchases). | Prevents one Play purchase from unlocking many accounts. Support cases go through admin promotional grants. |
 | D10 | Provisioning does not block on RevenueCat. The user is active as `free` immediately and the RevenueCat customer creation is retried. | Free scoring needs no backend, and a third-party outage must not block sign-up. Deviation from the diagram note "create in RevenueCat before changing user to active". |
@@ -456,6 +460,7 @@ Then I remain premium during grace and see a "Fix payment" banner linking to Goo
 | D13 | Prices live only in Play Console / RevenueCat. Products are monthly + annual. | Price changes need no release. "License" in issue #27 means the entitlement/licence-to-use, not the source code licence. |
 | D14 | PostgreSQL with one DB and per-service schemas for `LiveScoreCounter.Users` (see A4). | Low operational cost on a single VM while keeping ownership boundaries. |
 | D15 | The feature map lives in Gateway config and is published to the app via `/api/v1/features`. The app embeds a fallback copy. | One authoritative definition; the app works offline and on first launch. |
+| D16 | **Owner instruction:** the WearOS app is ignored for this feature. Client scope is the Android phone app only. | Explicit owner direction during drafting. Server-side gating is unchanged and client-agnostic. |
 
 ### 11.2 Assumptions (to be validated)
 
@@ -467,7 +472,7 @@ Then I remain premium during grace and see a "Fix payment" banner linking to Goo
 | A4 | No existing shared DB engine is mandated on the VM; PostgreSQL is acceptable. | Swap the EF Core provider; the schema design is unchanged. |
 | A5 | There is no official RevenueCat .NET MAUI SDK. The app will use a .NET Android binding of `purchases-android` (pinned version, same approach as `RootEncoder.Binding`) or a maintained community binding, behind `IPurchasesService`. **A spike is required first** (timebox 2 days). | This is the highest delivery risk. If it fails, fallback is Google Play Billing directly plus RevenueCat REST receipt posting (more work; D1 is unchanged). |
 | A6 | Firebase ID tokens have a 60 min lifetime and the app uses the Firebase SDK's token refresh. | D5 bound changes accordingly. |
-| A7 | The WearOS app talks to the backend through the same Gateway and can surface a server error message. Its exact codebase location is unknown. | FR-APP-10 may need a separate small task in the watch repo. |
+| A7 | Gating `sessions.remote.host` at the Gateway does not break existing WearOS usage in a way the owner cares about for v1 (for example, a free host can no longer create sessions the watch joins). | If the WearOS flow must keep working for free users, temporarily set `sessions.remote.host` to `free` in config (no code change) until O6 is resolved. |
 | A8 | Separate Firebase projects / RevenueCat environments exist (or will) for dev and prod. Until the owner supplies credentials, everything runs in fake mode. | Sandbox flag (FR-WH-03) handles a shared RevenueCat project. A shared Firebase project needs care with test claims. |
 | A9 | Users are currently able to use local scoring without signing in. | If sign-in is currently mandatory, AC-APP-01's "signed out" clause is downgraded to "signed in with an expired token". |
 
@@ -478,3 +483,4 @@ Then I remain premium during grace and see a "Fix payment" banner linking to Goo
 - O3 Terms of Service and Privacy Policy URLs and content.
 - O4 Final values for success-metric targets M5/M6 after baseline.
 - O5 Schedule the account-deletion/GDPR follow-up before public paid launch.
+- O6 Create a follow-up issue defining WearOS behaviour under tiers (messaging on 403 tier-required, whether the watch counts as a "controller device" for gating).
