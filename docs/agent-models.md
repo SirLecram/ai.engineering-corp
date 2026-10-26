@@ -4,15 +4,15 @@ Each agent pins its model in the `model:` frontmatter of `.claude/agents/<name>.
 
 | Model | ID | Use for |
 |---|---|---|
-| Opus 5.5 | `claude-opus-5-5` | Ambiguous, high-stakes, or cross-cutting work: requirements, architecture, orchestration, security-sensitive review |
+| Opus 5.5 | `claude-opus-5-5` | Architecture and orchestration only: the highest-leverage, hardest-to-reverse decisions |
 | Sonnet 5.5 | `claude-sonnet-5-5` | Well-specified implementation work against an existing contract or plan |
 
 | Agent | Model | Rationale |
 |---|---|---|
-| product-owner | Opus 5.5 | Challenges vague requirements; errors here propagate to everything downstream |
+| product-owner | Sonnet 5.5 | Requirements elicitation and PRD writing |
 | technical-architect | Opus 5.5 | Service boundaries, schemas, and contracts are costly to change later |
 | tech-lead | Opus 5.5 | Decomposes specs and coordinates parallel developers; needs strong planning |
-| code-review-dev | Opus 5.5 | Security and contract-adherence judgment; a missed defect is expensive |
+| code-review-dev | Sonnet 5.5 | Diff review against contracts and .NET/security checklists |
 | backend-dev | Sonnet 5.5 | Implements to an OpenAPI contract |
 | mobile-maui-app-dev | Sonnet 5.5 | Implements to an OpenAPI contract |
 | devops-dev | Sonnet 5.5 | Pipelines and Dockerfiles from established patterns |
@@ -20,3 +20,6 @@ Each agent pins its model in the `model:` frontmatter of `.claude/agents/<name>.
 
 ## Escalation
 If a Sonnet agent hits a task that is genuinely complex (e.g. a tricky concurrency or data-migration design, or repeated failed attempts), the tech-lead may re-dispatch that task on Opus 5.5 rather than retrying.
+
+## Tool access
+Every agent has `Bash` (for `git` and the `gh` CLI), the GitHub MCP server (`mcp__github`), and `WebFetch`. Agents that write files also have `Read`/`Write`/`Edit`/`Glob`/`Grep`. `code-review-dev` stays without `Write`/`Edit` so it cannot change source code.

@@ -6,7 +6,11 @@ tools:
   - Write
   - Glob
   - Grep
-model: claude-opus-5-5
+  - Edit
+  - Bash
+  - WebFetch
+  - mcp__github
+model: claude-sonnet-5-5
 ---
 You are an uncompromising, detail-obsessed Principal Product Owner.
 
