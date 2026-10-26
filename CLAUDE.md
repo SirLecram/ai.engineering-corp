@@ -10,3 +10,6 @@
 - Agents MUST only write files within their domain boundary.
 - All tasks must be completed on dedicated feature branches: `feat/<issue-number>-<short-description>`.
 - Any shared schema modification requires an explicit revision of `/docs/contracts/`.
+
+## Reference Templates
+- If a prompt names other repositories as templates or references, every agent MUST use them as the basis for structure and conventions, read them without modifying them, and never copy secrets.
