@@ -109,3 +109,19 @@ Limits: StreamPlatformManagement, RemoteSessions and the SignalR proxy are not i
 - Port 443 and the certificate are not set up; the app already points at `https://lsc-app.duckdns.org/`, so it cannot reach the Gateway until TLS works.
 - Gateway is in `AuditOnly`: premium features are not blocked server-side until you set `TierAuthorization__EnforcementMode=Enforce`.
 - App leftovers: premium-ended banner, join-entry badge, returning to the paywall after sign-in; the Identity client's provision method returns an empty profile (extra call to `me/entitlement`).
+
+## 7. Step-by-step: from checkpoint to a working test
+
+**Stage 1 - local, no accounts (works today).** Section 5, "Full local stack". Expect `smoke.sh` 60/60. Check both enforcement modes. This validates Gateway + Identity + Subscriptions + database + migrators together with test tokens and a fake RevenueCat.
+
+**Stage 2 - app against the local stack (Debug).** Build the Android Debug head with `Billing:Provider=Fake` (`appsettings.Local.json`), point the Gateway base URL in the same file to your machine (`http://10.0.2.2:5300` for the emulator; cleartext needs `android:usesCleartextTraffic`, see App#148), sign in with a test token flow or Firebase test user. Walk through: local scoring (no network), locked "Go Live" / "Enable remote control" badge, paywall states with the fake service, purchase -> activating -> unlock.
+
+**Stage 3 - deploy to the VM (needs your accounts; order matters).**
+1. DNS `lsc-app.duckdns.org` -> VM IP (done), ports 80/443 open in OCI + VM firewall (443 was still timing out), then certificate: DevOps `readmes/06-TLS-DUCKDNS.md`.
+2. Merge DevOps `feat/premium-tiers` review PR (#35) FIRST. Then on the VM: `scripts/init-users-secrets.sh`, put owner secrets in the secrets folder (DevOps `readmes/08`, `07`), keep `.env` in fake mode (`LSC_USERS_MODE=Fake`, Staging) for a first boot, `docker compose up -d`, check health. Runbook: `readmes/09-PREMIUM-TIERS-RUNBOOK.md`.
+3. Merge Api review PR (#32) (publishes the gateway image; the Gateway needs the two internal keys and `TierAuthorization__AllowAuditOnlyInProduction=true` from compose, otherwise it refuses to start). Keep `AuditOnly`.
+4. Merge App review PR (#175) (packages an Android release); install it from the Play internal track.
+5. Real mode: add Firebase service account, RevenueCat secret key + webhook token; set `LSC_USERS_MODE=Real`, `LSC_USERS_ENVIRONMENT=Production`; configure the RevenueCat webhook `https://lsc-app.duckdns.org/webhooks/revenuecat` with `Authorization: Bearer <token>`. First admin: `docker exec lsc-identity dotnet LSC.Identity.dll admin grant <uid> --reason "..."`.
+6. Test: promotional entitlement in RevenueCat for a tester -> app unlocks; license-tester purchase on the internal track; then switch to `Enforce` per the runbook and re-test the locked flows.
+
+**Troubleshooting.** Gateway refuses to start in Production: missing internal keys or `AllowAuditOnlyInProduction` not set. Services start without DB/RevenueCat config: the secrets directory fix (Users + Api, `/run/secrets`) must be merged first. CI restore 403 in Api/App: grant package access (four Users packages). `http://<vm-ip>/` stops working after DevOps deploy: use the hostname (the transitional port-80 block is being added in the DevOps fix PR).
